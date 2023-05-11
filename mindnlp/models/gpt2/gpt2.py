@@ -14,22 +14,76 @@
 # ============================================================================
 """MindNLP gpt2 model"""
 # pylint: disable=C0103
+# pylint: disable=C0415
+# pylint: disable=W0621
 
 from typing import Optional, Tuple
 
+import os
 import mindspore
 import numpy as np
 from mindspore import nn, ops, Parameter, Tensor, dtype_to_nptype
 
+from mindnlp.abc import PreTrainedModel
 from mindnlp._legacy.functional import tril, split, where, arange
 from mindnlp._legacy.nn import Dropout
-from mindnlp.models.gpt2.config_gpt2 import GPT2Config
+from mindnlp.configs import MINDNLP_MODEL_URL_BASE
 from ..utils import logging
 from ..utils.activations import ACT2FN
 from ..utils.utils import SequenceSummary
 from ..utils.utils import Conv1D, prune_conv1d_layer, find_pruneable_heads_and_indices
+from .config_gpt2 import GPT2Config, GPT2_SUPPORT_LIST
 
 logger = logging.get_logger(__name__)
+
+PRETRAINED_MODEL_ARCHIVE_MAP = {
+    model: MINDNLP_MODEL_URL_BASE.format('gpt2', model) for model in GPT2_SUPPORT_LIST
+}
+
+
+__all__ = ['GPT2Attention', 'GPT2DoubleHeadsModel', 'GPT2ForSequenceClassification',
+           'GPT2ForTokenClassification', 'GPT2LMHeadModel', 'GPT2Model', 'GPT2MLP']
+
+def torch_to_mindspore(pth_file, **kwargs):
+    """torch to mindspore."""
+    prefix = kwargs.get("prefix", "")
+
+    import logging
+    try:
+        import torch
+    except Exception as exc:
+        raise ImportError("'import torch' failed, please install torch by "
+                          "`pip install torch` or instructions from 'https://pytorch.org'") \
+            from exc
+
+    from mindspore.train.serialization import save_checkpoint
+
+    logging.info('Starting checkpoint conversion.')
+    ms_ckpt = []
+    state_dict = torch.load(pth_file, map_location=torch.device('cpu'))
+
+    for k, v in state_dict.items():
+        if 'wte.' in k:
+            k = k.replace('.weight', '.embedding_table')
+        if 'wpe.' in k:
+            k = k.replace('.weight', '.embedding_table')
+        if 'weight' in k and 'lm_head.weight' not in k:
+            k = k.replace('weight', 'gamma')
+        if '.bias' in k and '.attn.bias' not in k:
+            k = k.replace('.bias', '.beta')
+        if prefix:
+            k = prefix + "." + k
+        ms_ckpt.append({'name': k, 'data': Tensor(v.numpy())})
+
+    ms_ckpt_path = pth_file.replace('pytorch_model.bin', 'mindspore.ckpt')
+    if not os.path.exists(ms_ckpt_path):
+        try:
+            save_checkpoint(ms_ckpt, ms_ckpt_path)
+        except Exception as exc:
+            raise RuntimeError(f'Save checkpoint to {ms_ckpt_path} failed, please checkout the path.') \
+                from exc
+
+    return ms_ckpt_path
 
 
 class GPT2Attention(nn.Cell):
@@ -41,7 +95,7 @@ class GPT2Attention(nn.Cell):
         super().__init__()
 
         max_positions = config.max_position_embeddings
-        self.bias = Parameter(tril(ops.ones((max_positions, max_positions), mindspore.int32)).view(
+        self.bias = Parameter(tril(ops.ones((max_positions, max_positions), mindspore.float32)).view(
             1, 1, max_positions, max_positions), requires_grad=False)
         self.masked_bias = Parameter(Tensor(-1e4), requires_grad=False)
 
@@ -343,19 +397,18 @@ class GPT2Block(nn.Cell):
         return outputs  # hidden_states, present, (attentions, cross_attentions)
 
 
-class GPT2PreTrainedModel(nn.Cell):
+class GPT2PreTrainedModel(PreTrainedModel):
     """
     An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
     models.
     """
     config_class = GPT2Config
+    convert_torch_to_mindspore = torch_to_mindspore
+    pretrained_model_archive_map = PRETRAINED_MODEL_ARCHIVE_MAP
     base_model_prefix = "transformer"
     is_parallelizable = True
     supports_gradient_checkpointing = True
     _no_split_modules = ["GPT2Block"]
-
-    def __init__(self, *inputs, **kwargs):
-        super().__init__(*inputs, **kwargs)
 
     def get_head_mask(self, head_mask, num_hidden_layers, is_attention_chunked=False):
         """
@@ -385,6 +438,18 @@ class GPT2PreTrainedModel(nn.Cell):
         if isinstance(module, GPT2Model):
             module.gradient_checkpointing = value
 
+    def get_input_embeddings(self):
+        pass
+
+    def get_position_embeddings(self):
+        pass
+
+    def resize_position_embeddings(self):
+        pass
+
+    def set_input_embeddings(self):
+        pass
+
 
 class GPT2Model(GPT2PreTrainedModel):
     r"""
@@ -392,7 +457,7 @@ class GPT2Model(GPT2PreTrainedModel):
     """
 
     def __init__(self, config):
-        super().__init__()
+        super().__init__(config)
         self.config = config
 
         self.embed_dim = config.hidden_size
@@ -552,10 +617,13 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
     gpt2 LMHead Model
     """
 
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__(config)
         self.transformer = GPT2Model(config)
         self.lm_head = nn.Dense(config.hidden_size, config.vocab_size, has_bias=False)
+
+        ignore_index = kwargs.pop('ignore_index', -1)
+        self.loss_fct = nn.CrossEntropyLoss(ignore_index=ignore_index)
 
     def get_output_embeddings(self):
         """
@@ -641,8 +709,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             shift_logits = lm_logits[..., :-1, :]
             shift_labels = labels[..., 1:]
             # Flatten the tokens
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.shape[-1]), shift_labels.view(-1))
+            loss = self.loss_fct(shift_logits.view(-1, shift_logits.shape[-1]), shift_labels.view(-1))
 
         output = (lm_logits,) + transformer_outputs[1:]
         return ((loss,) + output) if loss is not None else output

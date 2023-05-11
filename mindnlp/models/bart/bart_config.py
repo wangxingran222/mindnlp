@@ -15,9 +15,9 @@
 """
 Bart Model config
 """
-from mindnlp.abc.backbones.pretrained import PretrainedConfig
+from mindnlp.abc import PreTrainedConfig
 
-class BartConfig(PretrainedConfig):
+class BartConfig(PreTrainedConfig):
     """
     Configuration for Bart
     """

@@ -27,7 +27,7 @@ from mindspore import nn
 from mindspore import dtype as mstype
 import mindspore
 from mindspore.common.initializer import initializer, Normal
-from mindnlp.abc.backbones.pretrained import PretrainedModel
+from mindnlp.abc import PreTrainedModel
 from ..utils.activations import ACT2FN
 
 from mindnlp.models.bart.bart_config import BartConfig
@@ -428,7 +428,7 @@ class BartClassificationHead(nn.Cell):
         hidden_states = self.out_proj(hidden_states)
         return hidden_states
 
-class BartPretrainedModel(PretrainedModel):
+class BartPretrainedModel(PreTrainedModel):
     config_class = BartConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
